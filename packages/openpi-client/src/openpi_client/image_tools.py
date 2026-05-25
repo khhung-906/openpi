@@ -1,3 +1,4 @@
+# Uses cv2 instead of PIL for faster resizing 
 import numpy as np
 import cv2
 

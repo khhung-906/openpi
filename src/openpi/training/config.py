@@ -18,6 +18,7 @@ import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
+import openpi.policies.bidroid_policy as bidroid_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
@@ -437,6 +438,8 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
     use_cartesian_state: bool = False
     # Output image size (H, W) from model transforms. Override via train config so buffer and transform match (e.g. 84 for RLPD).
     model_image_resize: int = 224
+    # Feed exterior_image_2_left to the third image slot instead of masked zeros.
+    use_second_exterior: bool = False
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -460,8 +463,61 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
         # DroidInputs builds state = concat(observation/cartesian_position or observation/joint_position, gripper).
         # We assume joint *velocity* actions, so we should *not* apply an additional delta transform.
         data_transforms = _transforms.Group(
-            inputs=[droid_policy.DroidInputs(model_type=model_config.model_type)],
+            inputs=[droid_policy.DroidInputs(
+                model_type=model_config.model_type,
+                use_second_exterior=self.use_second_exterior,
+            )],
             outputs=[droid_policy.DroidOutputs(action_dim=self.output_action_dim)],
+        )
+        model_transforms = ModelTransformFactory(
+            image_resize=self.model_image_resize,
+        )(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotBiDroidDataConfig(DataConfigFactory):
+    """Data config for a bimanual DROID (bidroid) dataset in LeRobot format.
+
+    Three distinct cameras (side + two wrists) and a 14D state/action (7D per arm).
+    Feature names match the env's saved_observation keys and the conversion script
+    (scripts/convert_bidroid_data_to_lerobot.py), so no renaming is needed across the
+    SFT (LeRobot) and RL (raw HDF5) paths.
+    """
+
+    # 14 = 7D per arm (6D cartesian velocity + 1D gripper).
+    output_action_dim: int = 14
+    # "both" (14D state) or "left"/"right" (that arm's 7D state; one-arm tasks).
+    arm: str = "both"
+    # Output image size (H, W) from model transforms.
+    model_image_resize: int = 224
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Repack only renames keys: raw LeRobot keys -> observation/<name> for BiDroidInputs.
+        repack_mapping = {
+            "observation/side_image": "side_image",
+            "observation/left_wrist_image": "left_wrist_image",
+            "observation/right_wrist_image": "right_wrist_image",
+            "observation/left_cartesian_position": "left_cartesian_position",
+            "observation/left_gripper_position": "left_gripper_position",
+            "observation/right_cartesian_position": "right_cartesian_position",
+            "observation/right_gripper_position": "right_gripper_position",
+            "actions": "actions",
+            "prompt": "prompt",
+        }
+        repack_transform = _transforms.Group(
+            inputs=[_transforms.RepackTransform(repack_mapping)]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[bidroid_policy.BiDroidInputs(model_type=model_config.model_type, arm=self.arm)],
+            outputs=[bidroid_policy.BiDroidOutputs(action_dim=self.output_action_dim)],
         )
         model_transforms = ModelTransformFactory(
             image_resize=self.model_image_resize,
@@ -873,6 +929,152 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="expo_pi05_droid_lora_finetune_sft_cartesian_state",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotDROIDDataConfig(
+            repo_id="",
+            output_action_dim=7,
+            use_cartesian_state=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=0,
+            peak_lr=2.5e-5,
+            decay_steps=100_000,
+            decay_lr=2.5e-5,
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    # Same as above, but the third image slot carries exterior_image_2_left instead of
+    # masked zeros. Pair it with an env writing side frames at t/t-k/t-2k into the three
+    # image keys (DroidEnv side_frame_stack), which drops the wrist view from the policy.
+    TrainConfig(
+        name="expo_pi05_droid_lora_finetune_sft_cartesian_state_stack3",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotDROIDDataConfig(
+            repo_id="",
+            output_action_dim=7,
+            use_cartesian_state=True,
+            use_second_exterior=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=0,
+            peak_lr=2.5e-5,
+            decay_steps=100_000,
+            decay_lr=2.5e-5,
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    # Bimanual DROID (bidroid) finetune. Same recipe as the droid LoRA SFT config but
+    # uses LeRobotBiDroidDataConfig (3 distinct cameras, 14D per-arm state/action) from
+    # scripts/convert_bidroid_data_to_lerobot.py. Reused for both SFT and expo RL.
+    TrainConfig(
+        name="expo_pi05_bidroid_lora_finetune_sft_cartesian_state",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotBiDroidDataConfig(
+            repo_id="",
+            output_action_dim=14,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=0,
+            peak_lr=2.5e-5,
+            decay_steps=100_000,
+            decay_lr=2.5e-5,
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    # One-arm bidroid variant (fixed_arm tasks): the moving (left) arm only ->
+    # 7D state/action; the fixed right arm's constant fields stay out of the
+    # norm stats. Same recipe/cameras as the bimanual bidroid config.
+    TrainConfig(
+        name="expo_pi05_bidroid_one_arm_lora_finetune_sft_cartesian_state",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotBiDroidDataConfig(
+            repo_id="",
+            output_action_dim=7,
+            arm="left",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=0,
+            peak_lr=2.5e-5,
+            decay_steps=100_000,
+            decay_lr=2.5e-5,
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    # Robomimic (robosuite) finetune. Reuses LeRobotDROIDDataConfig because the
+    # conversion script in scripts/square/convert_robomimic_data_to_lerobot.py
+    # writes the same DROID-style keys (exterior_image_*, wrist_image_left,
+    # cartesian_position 6D, gripper_position 1D, 7D OSC_POSE actions).
+    # Separate name keeps norm stats and run logs isolated from DROID.
+    TrainConfig(
+        name="expo_pi05_robomimic_lora_finetune_sft_cartesian_state",
         model=pi0_config.Pi0Config(
             pi05=True,
             action_dim=32,

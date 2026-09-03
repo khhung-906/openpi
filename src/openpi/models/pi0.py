@@ -44,20 +44,23 @@ def make_attn_mask(input_mask, mask_ar):
     return jnp.logical_and(attn_mask, valid_mask)
 
 
-@at.typecheck
 def posemb_sincos(
-    pos: at.Real[at.Array, " b"], embedding_dim: int, min_period: float, max_period: float
-) -> at.Float[at.Array, "b {embedding_dim}"]:
-    """Computes sine-cosine positional embedding vectors for scalar positions."""
+    pos, embedding_dim: int, min_period: float, max_period: float
+):
+    """Computes sine-cosine positional embedding vectors for scalar positions.
+
+    Accepts `pos` of any shape; output has shape `pos.shape + (embedding_dim,)`.
+    """
     if embedding_dim % 2 != 0:
         raise ValueError(f"embedding_dim ({embedding_dim}) must be divisible by 2")
 
     fraction = jnp.linspace(0.0, 1.0, embedding_dim // 2)
     period = min_period * (max_period / min_period) ** fraction
+    freq = 1.0 / period * 2 * jnp.pi  # (embedding_dim/2,)
     sinusoid_input = jnp.einsum(
-        "i,j->ij",
+        "...,j->...j",
         pos,
-        1.0 / period * 2 * jnp.pi,
+        freq,
         precision=jax.lax.Precision.HIGHEST,
     )
     return jnp.concatenate([jnp.sin(sinusoid_input), jnp.cos(sinusoid_input)], axis=-1)
@@ -136,15 +139,15 @@ class Pi0(_model.BaseModel):
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask
 
-    @at.typecheck
     def embed_suffix(
-        self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"]
-    ) -> tuple[
-        at.Float[at.Array, "b s emb"],
-        at.Bool[at.Array, "b s"],
-        at.Bool[at.Array, " s"],
-        at.Float[at.Array, "b emb"] | None,
-    ]:
+        self, obs: _model.Observation, noisy_actions: _model.Actions, timestep
+    ):
+        """Embed action suffix tokens with time conditioning.
+
+        `timestep` may be either per-batch `(B,)` or per-token `(B, H)`. The non-pi05
+        branch requires `(B,)`. The pi05 branch produces per-token adaRMS conditioning
+        of shape `(B, H, emb)` when `timestep.ndim == 2`, else `(B, emb)`.
+        """
         input_mask = []
         ar_mask = []
         tokens = []
@@ -155,12 +158,14 @@ class Pi0(_model.BaseModel):
             input_mask.append(jnp.ones((obs.state.shape[0], 1), dtype=jnp.bool_))
             # image/language inputs do not attend to state or actions
             ar_mask += [True]
+            assert timestep.ndim == 1, "non-pi05 path requires per-batch timestep"
 
         action_tokens = self.action_in_proj(noisy_actions)
         # embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
         time_emb = posemb_sincos(timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0)
         if self.pi05:
-            # time MLP (for adaRMS)
+            # time MLP (for adaRMS) — operates element-wise so it works for both
+            # (B, emb) and (B, H, emb) inputs.
             time_emb = self.time_mlp_in(time_emb)
             time_emb = nnx.swish(time_emb)
             time_emb = self.time_mlp_out(time_emb)
@@ -371,5 +376,99 @@ class Pi0(_model.BaseModel):
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
 
         x_0 = einops.rearrange(x_0, 'b ns ah ad -> (b ns) ah ad')
-        
+
         return x_0
+
+    def sample_actions_with_prefix(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        prefix: at.Float[at.Array, "b delay ad"],
+        num_steps: int | at.Int[at.Array, ""] = 10,
+        num_samples: int = 1,
+        noise: at.Float[at.Array, "b ns ah ad"] | None = None,
+    ) -> _model.Actions:
+        """Prefix-inpainted flow-matching sampler (fast-chunking P1).
+
+        Identical to ``sample_actions`` except the first ``delay = prefix.shape[1]``
+        action positions are clamped to the clean ``prefix`` at every Euler step,
+        with per-token time held at 0 there (the model is told those positions are
+        already clean) and ``t`` on the rest. Crucially it keeps the same
+        KV-cache structure as ``sample_actions``: the image/state prefix is encoded
+        once and the cache reused across denoise steps and ``num_samples`` — so its
+        memory/compute match the vanilla sampler instead of re-running the full
+        prefix forward every step.
+
+        Args:
+            prefix: ``(b, delay, action_dim)`` clean actions in the padded action
+                space, occupying chunk positions ``[0:delay]``.
+        Returns:
+            Actions of shape ``(b * num_samples, action_horizon, action_dim)``.
+        """
+        preprocess_rng, noise_rng = jax.random.split(rng, 2)
+        observation = _model.preprocess_observation(preprocess_rng, observation, train=False)
+        dt = -1.0 / num_steps
+        batch_size = observation.state.shape[0]
+        H, ad = self.action_horizon, self.action_dim
+        delay = prefix.shape[1]
+
+        # Clean prefix in [0:delay], zeros after; postfix mask is 0 on the clamped
+        # prefix positions and 1 on the positions being denoised.
+        prefix_full = jnp.concatenate(
+            [prefix, jnp.zeros((batch_size, H - delay, ad), dtype=prefix.dtype)], axis=1
+        )  # (b, H, ad)
+        postfix_mask = jnp.concatenate(
+            [jnp.zeros((batch_size, delay), dtype=jnp.float32),
+             jnp.ones((batch_size, H - delay), dtype=jnp.float32)], axis=1
+        )  # (b, H)
+
+        if noise is None:
+            noise = jax.random.normal(noise_rng, (batch_size, num_samples, H, ad))
+        else:
+            assert noise.shape == (batch_size, num_samples, H, ad), (
+                f"Expected noise shape {(batch_size, num_samples, H, ad)}, got {noise.shape}"
+            )
+
+        # Fill the KV cache once from the (image/state) prefix, then reuse it for
+        # every denoise step and every sample (exactly like ``sample_actions``).
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+
+        obs_repeated = jax.tree_map(lambda x: einops.repeat(x, "b ... -> (b ns) ...", ns=num_samples), observation)
+        kv_cache = jax.tree_map(lambda x: einops.repeat(x, "l b t h d -> l (b ns) t h d", ns=num_samples), kv_cache)
+        prefix_mask = einops.repeat(prefix_mask, "b p -> (b ns) p", ns=num_samples)
+        prefix_clamp = einops.repeat(prefix_full, "b h d -> (b ns) h d", ns=num_samples)
+        postfix_mask = einops.repeat(postfix_mask, "b h -> (b ns) h", ns=num_samples)  # (B, H)
+        postfix_mask_3d = postfix_mask[..., None]  # (B, H, 1)
+
+        def clamp(x):  # keep the prefix positions pinned to the clean GT
+            return x * postfix_mask_3d + prefix_clamp * (1.0 - postfix_mask_3d)
+
+        x_init = clamp(einops.rearrange(noise, "b ns ah ad -> (b ns) ah ad"))
+
+        def step(carry):
+            x_t, time = carry  # x_t: (B, H, ad)
+            time_per_pos = time * postfix_mask  # (B, H): 0 on clamped prefix, t on postfix
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+                obs_repeated, x_t, time_per_pos
+            )
+            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+            prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+            full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
+            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+            (_, suffix_out), _ = self.PaliGemma.llm(
+                [None, suffix_tokens], mask=full_attn_mask, positions=positions,
+                kv_cache=kv_cache, adarms_cond=[None, adarms_cond],
+            )
+            v_t = self.action_out_proj(suffix_out[:, -H:])  # (B, H, ad)
+            return clamp(x_t + dt * v_t), time + dt
+
+        def cond(carry):
+            _, time = carry
+            return time >= -dt / 2
+
+        x_0, _ = jax.lax.while_loop(cond, step, (x_init, 1.0))
+        return x_0  # (b * num_samples, H, ad)

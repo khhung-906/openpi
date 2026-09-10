@@ -909,43 +909,6 @@ _CONFIGS = [
         ).get_freeze_filter(),
         ema_decay=None,
     ),
-    # Same as above, but the third image slot carries exterior_image_2_left instead of
-    # masked zeros. Pair it with an env writing side frames at t/t-k/t-2k into the three
-    # image keys (DroidEnv side_frame_stack), which drops the wrist view from the policy.
-    TrainConfig(
-        name="expo_pi05_droid_lora_finetune_sft_cartesian_state_stack3",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=16,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ),
-        data=LeRobotDROIDDataConfig(
-            repo_id="",
-            output_action_dim=7,
-            use_cartesian_state=True,
-            use_second_exterior=True,
-            base_config=DataConfig(prompt_from_task=True),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=20_000,
-        batch_size=64,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=0,
-            peak_lr=2.5e-5,
-            decay_steps=100_000,
-            decay_lr=2.5e-5,
-        ),
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=16,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
-        ema_decay=None,
-    ),
     # Robomimic (robosuite) finetune. Reuses LeRobotDROIDDataConfig because the
     # conversion script in scripts/square/convert_robomimic_data_to_lerobot.py
     # writes the same DROID-style keys (exterior_image_*, wrist_image_left,
